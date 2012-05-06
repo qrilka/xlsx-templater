@@ -1,2 +1,2 @@
 * About
-Simple xlsx writer, only basic functionality at the moment
+Library for creating xlsx data files from xlsx tempaltes
