@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Codec.Xlsx.Templater(
+  Orientation(..),
   TemplateSettings(..),
   TemplateValue(..),
   run
@@ -13,60 +14,72 @@ import qualified Data.Conduit.List as CL
 import           Data.Default (Default (..))
 import qualified Data.Map as M
 import           Data.Maybe
-import           Data.Text hiding (map)
+import           Data.Text (Text, pack)
 import           Data.Time.LocalTime
 import           Text.Parsec
 import           Text.Parsec.Text
 
-data TemplateSettings = TemplateSettings { }
+data Orientation =  Rows | Columns
+data TemplateSettings = TemplateSettings { tsOrientation :: Orientation 
+                                         , tsRepeated    :: Int
+                                         }
 data TemplateValue = TplText Text | TplDouble Double | TplLocalTime LocalTime
-type DataRow = M.Map Text TemplateValue
+type TemplateDataRow = M.Map Text TemplateValue
 
 data Converter = Match Text | PassThrough
                deriving Show
 
-data TmplCell = TmplCell{ converter :: Converter
-                        , srcCell :: Cell }
+data TplCell = TplCell{ converter :: Converter
+                      , srcCell   :: Cell
+                      }
               deriving Show
 
-buildTemplate :: [Cell] -> [TmplCell]
-buildTemplate = map build
+tpl2xlsx :: TemplateValue -> Maybe CellValue
+tpl2xlsx (TplText t) = Just $ CellText t
+tpl2xlsx (TplDouble d) = Just $ CellDouble d
+tpl2xlsx (TplLocalTime t) = Just $ CellLocalTime t
+
+replacePlaceholders :: [[Cell]] -> TemplateDataRow -> [[Cell]]
+replacePlaceholders d tdr = map (map replace) d
   where
-    build cell = TmplCell{ converter = conv cell
-                         , srcCell = cell}
-    conv cell =
-      case cellValue cell of
-        Just v@(CellText t)  -> either (const $ PassThrough) Match (getVar t)
-        Nothing -> PassThrough
-    getVar = parse varParser "not gonna show up"
-    varParser :: Parser Text
+    replace :: Cell -> Cell
+    replace c@Cell{cellValue=Just (CellText t)} = either (const c) (\ph -> c{cellValue=phValue ph}) (getVar t)
+    replace c = c
+    phValue ph = maybe Nothing tpl2xlsx (M.lookup ph tdr)
+
+getVar = parse varParser "unnecessary error"
+  where
     varParser = do
       string "{{"
       name <- many1 $ noneOf "}"
       string "}}"
       return $ pack name
 
-applyTemplate :: [TmplCell] -> DataRow -> [Cell]
+buildTemplate :: [Cell] -> [TplCell]
+buildTemplate = map build
+  where
+    build cell = TplCell{ converter = conv cell
+                         , srcCell = cell}
+    conv cell =
+      case cellValue cell of
+        Just v@(CellText t)  -> either (const $ PassThrough) Match (getVar t)
+        Nothing -> PassThrough
+
+applyTemplate :: [TplCell] -> TemplateDataRow -> [Cell]
 applyTemplate t r = map transform t
   where
     transform tc =
       case converter tc of
         Match k     -> (srcCell tc){cellValue = tpl2xlsx $ fromJust $ M.lookup k r}
         PassThrough -> srcCell tc
-    tpl2xlsx (TplText t) = Just $ CellText t
-    tpl2xlsx (TplDouble d) = Just $ CellDouble d
-    tpl2xlsx (TplLocalTime t) = Just $ CellLocalTime t
 
-run :: FilePath -> FilePath -> TemplateSettings -> [DataRow] -> IO ()
-run tp op s d = do
+run :: FilePath -> FilePath -> TemplateDataRow -> (TemplateSettings, [TemplateDataRow]) -> IO ()
+run tp op cd (s,d) = do
   x@Xlsx{styles=Styles sbs} <- xlsx tp
-  templateRow <- sheet x 0 ["A","B","C","D"] $$ CL.head
-  
---  putStrLn $ "tmpl:" ++ show 
+  templateRows <- sheet x 0 ["A","B","C","D"] $$ CL.consume
 
-  let tpl = buildTemplate $ fromJust templateRow
-      d' = map (applyTemplate tpl) d
-      --map mapRow d
---      mapRow :: DataRow -> [Cell]
---      mapRow x = [maybe Nothing (Just CellText) $ M.lookup (pack "x") x]
+  let
+    (prolog, templateRow : epilog) = splitAt (tsRepeated s) (templateRows :: [[Cell]])
+    tpl = buildTemplate templateRow
+    d' = replacePlaceholders prolog cd ++ map (applyTemplate tpl) d ++ replacePlaceholders epilog cd
   writeXlsxStyles op sbs d'
