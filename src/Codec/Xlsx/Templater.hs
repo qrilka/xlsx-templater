@@ -20,7 +20,7 @@ import           Text.Parsec
 import           Text.Parsec.Text
 
 data Orientation =  Rows | Columns
-data TemplateSettings = TemplateSettings { tsOrientation :: Orientation 
+data TemplateSettings = TemplateSettings { tsOrientation :: Orientation
                                          , tsRepeated    :: Int
                                          }
 data TemplateValue = TplText Text | TplDouble Double | TplLocalTime LocalTime
@@ -73,13 +73,16 @@ applyTemplate t r = map transform t
         Match k     -> (srcCell tc){cellValue = tpl2xlsx $ fromJust $ M.lookup k r}
         PassThrough -> srcCell tc
 
-run :: FilePath -> FilePath -> TemplateDataRow -> (TemplateSettings, [TemplateDataRow]) -> IO ()
-run tp op cd (s,d) = do
-  x@Xlsx{styles=Styles sbs} <- xlsx tp
-  templateRows <- sheet x 0 ["A","B","C","D"] $$ CL.consume
-
+runSheet x n (cdr, ts, d) = do
+  templateRows <- sheet x n ["A","B","C","D"] $$ CL.consume
   let
-    (prolog, templateRow : epilog) = splitAt (tsRepeated s) (templateRows :: [[Cell]])
-    tpl = buildTemplate templateRow
-    d' = replacePlaceholders prolog cd ++ map (applyTemplate tpl) d ++ replacePlaceholders epilog cd
-  writeXlsxStyles op sbs d'
+    (prolog, templateRow : epilog) = splitAt (tsRepeated ts) (templateRows :: [[Cell]])
+    tpl = buildTemplate templateRow in
+    return (replacePlaceholders prolog cdr ++ map (applyTemplate tpl) d ++ replacePlaceholders epilog cdr)
+
+
+run :: FilePath -> FilePath -> [(TemplateDataRow, TemplateSettings, [TemplateDataRow])] -> IO ()
+run tp op options = do
+  x@Xlsx{styles=Styles sbs} <- xlsx tp
+  out <- mapM (\(n, opts) -> runSheet x n opts ) $ zip [0..] options
+  writeXlsxStyles op sbs out
