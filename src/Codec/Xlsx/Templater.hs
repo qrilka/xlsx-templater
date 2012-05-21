@@ -20,7 +20,9 @@ import           Data.Time.LocalTime
 import           Text.Parsec
 import           Text.Parsec.Text
 
+
 data Orientation =  Rows | Columns
+                 deriving (Show, Eq)
 data TemplateSettings = TemplateSettings { tsOrientation :: Orientation
                                          , tsRepeated    :: Int
                                          }
@@ -48,8 +50,8 @@ replacePlaceholders :: Int -> [[TplDataCell]] -> TemplateDataRow -> (Int, [[TplD
 replacePlaceholders n d tdr = countMap n (\n -> map $ replace n) d
   where
     replace :: Int -> TplDataCell -> TplDataCell
-    replace y (x, _, src@(Just cd@CellData{cdValue=CellText t})) = 
-      either (const (x, y, src)) (\ph -> (x, y, Just cd{cdValue=phValue ph})) (getVar t)
+    replace y (x, _, src@(Just cd@CellData{cdValue=Just (CellText t)})) =
+      either (const (x, y, src)) (\ph -> (x, y, Just cd{cdValue=Just (phValue ph)})) (getVar t)
     replace y (x, _, src) = (x, y, src)
     phValue ph = maybe (CellText ph) tpl2xlsx (M.lookup ph tdr)
 
@@ -77,7 +79,7 @@ buildTemplate = map build
                               , tplX         = x}
     conv cd =
       case cd of
-        Just CellData{cdValue=CellText t}  -> either (const $ PassThrough) Match (getVar t)
+        Just CellData{cdValue=Just (CellText t)}  -> either (const $ PassThrough) Match (getVar t)
         Nothing -> PassThrough
 
 applyTemplate :: [TplCell] -> Int -> TemplateDataRow -> [TplDataCell]
@@ -85,7 +87,10 @@ applyTemplate t y r = map transform t
   where
     transform tc = (tplX tc, y,
                     case tplConverter tc of
-                      Match k     -> fmap (\cd -> cd{cdValue = tpl2xlsx $ fromJust $ M.lookup k r}) (tplSrc tc)
+                      Match k     -> do
+                        cd <- tplSrc tc
+                        v <- M.lookup k r
+                        return cd{cdValue = Just (tpl2xlsx v)}
                       PassThrough -> tplSrc tc)
 
 
@@ -96,29 +101,40 @@ map2matrix (Just ((xmin,xmax), (ymin,ymax), m)) = [[lookupCell x y | x <- [1..xm
     lookupCell x y = (x, y, M.lookup (x, y) m)
 
 tplData2Cell :: TplDataCell -> Cell
-tplData2Cell (x, y, cd) = 
+tplData2Cell (x, y, cd) =
   case cd of
-    Nothing -> 
+    Nothing ->
       Cell{cellIx=(col,row), cellStyle=Nothing, cellValue=Nothing}
-    Just CellData{cdValue=v,cdStyle=s} -> 
-      Cell{cellIx=(col,row), cellStyle=s, cellValue=Just v}
+    Just CellData{cdValue=v,cdStyle=s} ->
+      Cell{cellIx=(col,row), cellStyle=s, cellValue=v}
   where
     col = int2col x
     row = y
 
+transpose               :: [[(Int, Int, a)]] -> [[(Int, Int, a)]]
+transpose []             = []
+transpose ([]   : xss)   = transpose xss
+transpose ((x:xs) : xss) = (swap x : [swap h | (h:_) <- xss]) : transpose (xs : [ t | (_:t) <- xss])
+  where
+    swap (x, y, d) = (y, x, d)
+
 runSheet x n (cdr, ts, d) = do
-  templateRows <- map2matrix <$> sheetMap x n
+  input <- map2matrix <$> sheetMap x n
   let
-    (prolog, templateRow : epilog) = splitAt (tsRepeated ts) templateRows -- :: [[Cell]])
-    tpl = buildTemplate templateRow 
-    (n,  prolog') = replacePlaceholders 1 prolog cdr 
-    (n', d') = countMap n (applyTemplate tpl) d 
-    (_,  epilog') = replacePlaceholders n' epilog cdr in
-    return $ map (map tplData2Cell) $ concat [prolog', d', epilog']
+    templateRows = if tsOrientation ts == Columns then transpose input else input
+    (prolog, templateRow : epilog) = splitAt (tsRepeated ts) templateRows
+    tpl = buildTemplate templateRow
+    (n,  prolog') = replacePlaceholders 1 prolog cdr
+    (n', d') = countMap n (applyTemplate tpl) d
+    (_,  epilog') = replacePlaceholders n' epilog cdr
+    output = concat [prolog', d', epilog']
+    result = if tsOrientation ts == Columns then transpose output else output
+    in
+   return $ map (map tplData2Cell) result
 
 
 run :: FilePath -> FilePath -> [(TemplateDataRow, TemplateSettings, [TemplateDataRow])] -> IO ()
 run tp op options = do
   x@Xlsx{styles=Styles sbs} <- xlsx tp
-  out <- mapM (\(n, opts) -> runSheet x n opts ) $ zip [0..] options
+  out <- mapM (\(n, opts) -> runSheet x n opts) $ zip [0..] options
   writeXlsxStyles op sbs out
