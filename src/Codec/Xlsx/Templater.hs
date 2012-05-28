@@ -13,6 +13,7 @@ import           Control.Applicative ((<$>))
 import           Data.Conduit
 import qualified Data.Conduit.List as CL
 import           Data.Default (Default (..))
+import           Data.List
 import qualified Data.Map as M
 import           Data.Maybe
 import           Data.Text (Text, pack)
@@ -46,22 +47,14 @@ tpl2xlsx (TplLocalTime t) = CellLocalTime t
 
 type TplDataCell = (Int, Int, Maybe CellData)
 
-replacePlaceholders :: Int -> [[TplDataCell]] -> TemplateDataRow -> (Int, [[TplDataCell]])
-replacePlaceholders n d tdr = countMap n (\n -> map $ replace n) d
+replacePlaceholders :: [[Maybe CellData]] -> TemplateDataRow -> [[Maybe CellData]]
+replacePlaceholders d tdr = map (map $ fmap replace) d
   where
-    replace :: Int -> TplDataCell -> TplDataCell
-    replace y (x, _, src@(Just cd@CellData{cdValue=Just (CellText t)})) =
-      either (const (x, y, src)) (\ph -> (x, y, Just cd{cdValue=Just (phValue ph)})) (getVar t)
-    replace y (x, _, src) = (x, y, src)
+    replace :: CellData -> CellData
+    replace cd@CellData{cdValue=Just (CellText t)} =
+      either (const cd) (\ph -> cd{cdValue=Just (phValue ph)}) (getVar t)
+    replace cd = cd
     phValue ph = maybe (CellText ph) tpl2xlsx (M.lookup ph tdr)
-
-countMap :: Int -> (Int -> a -> b) -> [a] -> (Int, [b])
-countMap n f [] = (n, [])
-countMap n f l = (n' + 1, transformed)
-  where
-    n' = fst $ last numbered
-    numbered = zip [n..] l
-    transformed = map (uncurry f) numbered -- (\(n, a) -> f n a)
 
 getVar = parse varParser "unnecessary error"
   where
@@ -71,70 +64,69 @@ getVar = parse varParser "unnecessary error"
       string "}}"
       return $ pack name
 
-buildTemplate :: [TplDataCell] -> [TplCell]
-buildTemplate = map build
+buildTemplate :: Int -> [Maybe CellData] -> [TplCell]
+buildTemplate x = map build
   where
-    build (x, _, cd) = TplCell{ tplConverter = conv cd
-                              , tplSrc       = cd
-                              , tplX         = x}
-    conv cd =
-      case cd of
-        Just CellData{cdValue=Just (CellText t)}  -> either (const $ PassThrough) Match (getVar t)
-        Nothing -> PassThrough
+    build cd = TplCell{ tplConverter = conv cd
+                      , tplSrc       = cd
+                      , tplX         = x}
+    conv (Just CellData{cdValue=Just (CellText t)}) = either (const PassThrough) Match (getVar t)
+    conv _ = PassThrough
 
-applyTemplate :: [TplCell] -> Int -> TemplateDataRow -> [TplDataCell]
-applyTemplate t y r = map transform t
+applyTemplate :: [TplCell] -> TemplateDataRow -> [Maybe CellData]
+applyTemplate t r = map transform t
   where
-    transform tc = (tplX tc, y,
-                    case tplConverter tc of
-                      Match k     -> do
-                        cd <- tplSrc tc
-                        v <- M.lookup k r
-                        return cd{cdValue = Just (tpl2xlsx v)}
-                      PassThrough -> tplSrc tc)
+    transform tc = case tplConverter tc of
+      Match k     -> do
+        cd <- tplSrc tc
+        v <- M.lookup k r
+        return cd{cdValue = Just (tpl2xlsx v)}
+      PassThrough -> tplSrc tc
 
-
-map2matrix :: (Maybe ((Int,Int), (Int,Int), M.Map (Int,Int) CellData)) -> [[TplDataCell]]
-map2matrix Nothing = error "invalid template"
-map2matrix (Just ((xmin,xmax), (ymin,ymax), m)) = [[lookupCell x y | x <- [1..xmax]] | y <- [1..ymax]]
+fixColumns :: [ColumnsWidth] -> Int -> Int -> [ColumnsWidth]
+fixColumns cw c n = prolog ++ dataepilog
   where
-    lookupCell x y = (x, y, M.lookup (x, y) m)
+    (prolog, rest) = span ((<c) . cwMax) cw
+    dataepilog = case rest of
+      [] -> []
+      (dCW : rest') -> fixD dCW : fixEpilog rest'
+    fixD (ColumnsWidth dMin dMax width) = ColumnsWidth dMin (dMax + n - 1) width
+    fixEpilog = map (\(ColumnsWidth dMin dMax width) -> ColumnsWidth (dMin + n - 1) (dMax + n - 1) width)
 
-tplData2Cell :: TplDataCell -> Cell
-tplData2Cell (x, y, cd) =
-  case cd of
-    Nothing ->
-      Cell{cellIx=(col,row), cellStyle=Nothing, cellValue=Nothing}
-    Just CellData{cdValue=v,cdStyle=s} ->
-      Cell{cellIx=(col,row), cellStyle=s, cellValue=v}
+fixRowHeights :: RowHeights -> Int -> Int -> RowHeights
+fixRowHeights rh r n = insertCopies $ shift removeOriginal
   where
-    col = int2col x
-    row = y
+    original = M.lookup r rh
+    removeOriginal = M.delete r rh
+    shift = M.mapKeys (\x -> if x > r then x + n - 1 else x)
+    insertCopies m = case original of
+      Just h -> foldr (\x m -> M.insert x h m) m [r..(r + n -1)]
+      Nothing -> m
 
-transpose               :: [[(Int, Int, a)]] -> [[(Int, Int, a)]]
-transpose []             = []
-transpose ([]   : xss)   = transpose xss
-transpose ((x:xs) : xss) = (swap x : [swap h | (h:_) <- xss]) : transpose (xs : [ t | (_:t) <- xss])
-  where
-    swap (x, y, d) = (y, x, d)
 
+runSheet :: Xlsx -> Int -> (TemplateDataRow, TemplateSettings, [TemplateDataRow]) -> IO Worksheet
 runSheet x n (cdr, ts, d) = do
-  input <- map2matrix <$> sheetMap x n
+  ws <- sheetMap x n
   let
-    templateRows = if tsOrientation ts == Columns then transpose input else input
-    (prolog, templateRow : epilog) = splitAt (tsRepeated ts) templateRows
-    tpl = buildTemplate templateRow
-    (n,  prolog') = replacePlaceholders 1 prolog cdr
-    (n', d') = countMap n (applyTemplate tpl) d
-    (_,  epilog') = replacePlaceholders n' epilog cdr
+    templateRows = if tsOrientation ts == Columns then transpose $ toList ws else toList ws
+    repeatRow = tsRepeated ts
+    (prolog, templateRow : epilog) = splitAt repeatRow templateRows
+    tpl = buildTemplate repeatRow templateRow
+    prolog' = replacePlaceholders prolog cdr
+    n = length d
+    d' = map (applyTemplate tpl) d
+    epilog' = replacePlaceholders epilog cdr
     output = concat [prolog', d', epilog']
     result = if tsOrientation ts == Columns then transpose output else output
+    (cw, rh) = if tsOrientation ts == Columns 
+                 then (fixColumns (wsColumns ws) (repeatRow + 1) n, wsRowHeights ws) 
+                 else (wsColumns ws, fixRowHeights (wsRowHeights ws) (repeatRow + 1) n)
     in
-   return $ map (map tplData2Cell) result
+   return $ fromList (wsName ws) cw rh result
 
 
 run :: FilePath -> FilePath -> [(TemplateDataRow, TemplateSettings, [TemplateDataRow])] -> IO ()
 run tp op options = do
   x@Xlsx{styles=Styles sbs} <- xlsx tp
-  out <- mapM (\(n, opts) -> runSheet x n opts) $ zip [0..] options
+  out <- mapM (uncurry (runSheet x)) $ zip [0..] options
   writeXlsxStyles op sbs out
