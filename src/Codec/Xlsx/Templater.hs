@@ -9,17 +9,12 @@ module Codec.Xlsx.Templater(
 import           Codec.Xlsx
 import           Codec.Xlsx.Parser
 import           Codec.Xlsx.Writer
-import           Control.Applicative ((<$>))
-import           Data.Conduit
-import qualified Data.Conduit.List as CL
-import           Data.Default (Default (..))
 import           Data.List
 import qualified Data.Map as M
-import           Data.Maybe
 import           Data.Text (Text, pack)
 import           Data.Time.LocalTime
 import           Text.Parsec
-import           Text.Parsec.Text
+import           Text.Parsec.Text()
 
 
 data Orientation =  Rows | Columns
@@ -45,8 +40,6 @@ tpl2xlsx (TplText t) = CellText t
 tpl2xlsx (TplDouble d) = CellDouble d
 tpl2xlsx (TplLocalTime t) = CellLocalTime t
 
-type TplDataCell = (Int, Int, Maybe CellData)
-
 replacePlaceholders :: [[Maybe CellData]] -> TemplateDataRow -> [[Maybe CellData]]
 replacePlaceholders d tdr = map (map $ fmap replace) d
   where
@@ -56,6 +49,7 @@ replacePlaceholders d tdr = map (map $ fmap replace) d
     replace cd = cd
     phValue ph = maybe (CellText ph) tpl2xlsx (M.lookup ph tdr)
 
+getVar :: Text -> Either ParseError Text
 getVar = parse varParser "unnecessary error"
   where
     varParser = do
@@ -79,8 +73,10 @@ applyTemplate t r = map transform t
     transform tc = case tplConverter tc of
       Match k     -> do
         cd <- tplSrc tc
-        v <- M.lookup k r
-        return cd{cdValue = Just (tpl2xlsx v)}
+        case M.lookup k r of
+          Just v  -> return cd{cdValue = Just (tpl2xlsx v)}
+          Nothing -> return cd
+
       PassThrough -> tplSrc tc
 
 fixColumns :: [ColumnsWidth] -> Int -> Int -> [ColumnsWidth]
@@ -100,7 +96,7 @@ fixRowHeights rh r n = insertCopies $ shift removeOriginal
     removeOriginal = M.delete r rh
     shift = M.mapKeys (\x -> if x > r then x + n - 1 else x)
     insertCopies m = case original of
-      Just h -> foldr (\x m -> M.insert x h m) m [r..(r + n -1)]
+      Just h -> foldr (\x m' -> M.insert x h m') m [r..(r + n -1)]
       Nothing -> m
 
 

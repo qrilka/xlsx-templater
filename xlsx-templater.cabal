@@ -31,7 +31,14 @@ Cabal-version:       >=1.6
 Library
   Hs-source-dirs:    src
   Exposed-modules:   Codec.Xlsx.Templater
-  Other-modules:     Test
+
+
+Executable           test
+  Hs-source-dirs:    src
+  ghc-options:       -rtsopts -Wall -threaded -O2
+
+  main-is:           Test.hs
+
   
   Build-depends:     base, containers, transformers, bytestring, text
                     , xlsx
