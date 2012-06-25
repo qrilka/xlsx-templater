@@ -2,6 +2,7 @@
 module Codec.Xlsx.Templater(
   Orientation(..),
   TemplateSettings(..),
+  TemplateDataRow,
   TemplateValue(..),
   run
   ) where
@@ -19,11 +20,16 @@ import           Text.Parsec.Text()
 
 data Orientation =  Rows | Columns
                  deriving (Show, Eq)
+
 data TemplateSettings = TemplateSettings { tsOrientation :: Orientation
-                                         , tsRepeated    :: Int
+                                         , tsRepeated    :: Int         -- ^ repeated row/column (depending on 'tsOrientation')
                                          }
+
+
 data TemplateValue = TplText Text | TplDouble Double | TplLocalTime LocalTime
                    deriving Show
+
+-- | data row as a map from template variable name to a 'TemplateValue'
 type TemplateDataRow = M.Map Text TemplateValue
 
 data Converter = Match Text | PassThrough
@@ -102,7 +108,7 @@ fixRowHeights rh r n = insertCopies $ shift removeOriginal
 
 runSheet :: Xlsx -> Int -> (TemplateDataRow, TemplateSettings, [TemplateDataRow]) -> IO Worksheet
 runSheet x n (cdr, ts, d) = do
-  ws <- sheetMap x n
+  ws <- sheet x n
   let
     templateRows = if tsOrientation ts == Columns then transpose $ toList ws else toList ws
     repeatRow = tsRepeated ts
@@ -114,15 +120,15 @@ runSheet x n (cdr, ts, d) = do
     epilog' = replacePlaceholders epilog cdr
     output = concat [prolog', d', epilog']
     result = if tsOrientation ts == Columns then transpose output else output
-    (cw, rh) = if tsOrientation ts == Columns 
-                 then (fixColumns (wsColumns ws) (repeatRow + 1) n, wsRowHeights ws) 
+    (cw, rh) = if tsOrientation ts == Columns
+                 then (fixColumns (wsColumns ws) (repeatRow + 1) n, wsRowHeights ws)
                  else (wsColumns ws, fixRowHeights (wsRowHeights ws) (repeatRow + 1) n)
     in
    return $ fromList (wsName ws) cw rh result
 
-
+-- | template runner: reads template, constructs new xlsx file based on template data and template settings
 run :: FilePath -> FilePath -> [(TemplateDataRow, TemplateSettings, [TemplateDataRow])] -> IO ()
 run tp op options = do
-  x@Xlsx{styles=Styles sbs} <- xlsx tp
+  x@Xlsx{xlStyles=Styles sbs} <- xlsx tp
   out <- mapM (uncurry (runSheet x)) $ zip [0..] options
   writeXlsxStyles op sbs out

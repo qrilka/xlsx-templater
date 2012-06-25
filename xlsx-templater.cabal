@@ -1,23 +1,20 @@
 Name:                xlsx-templater
 
--- The package version. See the Haskell package versioning policy
--- (http://www.haskell.org/haskellwiki/Package_versioning_policy) for
--- standards guiding when and how versions should be incremented.
-Version:             0.0
+Version:             0.0.1
 
 Synopsis:            Simple and incomplete Excel file templater
 Description:
     Library for creating xlsx data files from xlsx tempaltes.
 
 Homepage:            https://github.com/qrilka/xlsx-templater
+Bug-Reports:         https://github.com/qrilka/xlsx-templater/issues
 License:             MIT
 License-file:        LICENSE
 Author:              Kirill Zaborsky
 Maintainer:          qrilka@gmail.com
 
 
-
-Category:            Data
+Category:            Codec
 Build-type:          Simple
 
 -- Extra files to be distributed with the package, such as examples or
@@ -40,20 +37,17 @@ Executable           test
   main-is:           Test.hs
 
   
-  Build-depends:     base, containers, transformers, bytestring, text
-                    , xlsx
-                    , data-default == 0.4.*
-                    , conduit      == 0.4.*
-                    , parsec       == 3.1.*
-                    , time
-  
-  -- Modules not exported by this package.
-  -- Other-modules:       
-  
-  -- Extra tools (e.g. alex, hsc2hs, ...) needed to build the source.
-  -- Build-tools:         
+  Build-depends:     base         == 4.*
+                   , containers
+                   , transformers
+                   , bytestring
+                   , text
+                   , xlsx         == 0.0.1
+                   , data-default == 0.4.*
+                   , conduit      == 0.4.*
+                   , parsec       == 3.1.*
+                   , time
   
 source-repository head
   type:     git
   location: git://github.com/qrilka/xlsx-templater.git
-
