@@ -3,87 +3,45 @@ module Codec.Xlsx.Templater(
   Orientation(..),
   TemplateSettings(..),
   TemplateDataRow,
-  TemplateValue(..),
+  applyTemplateOnCell,
+  applyTemplateOnSheet,
+  applyTemplateOnXlsx,
   run
   ) where
 
-import           Codec.Xlsx
-import           Codec.Xlsx.Parser
+import           Codec.Xlsx.Types hiding (Orientation)
+import           Codec.Xlsx.Parser hiding (ParseError)
 import           Codec.Xlsx.Writer
-import           Data.List
+import           Control.Lens hiding (noneOf, op)
+import qualified Data.ByteString.Lazy as L
 import qualified Data.Map as M
 import           Data.Text (Text, pack)
-import           Data.Time.LocalTime
+import           Data.Time.Clock.POSIX
 import           Text.Parsec
 import           Text.Parsec.Text()
 
-
-data Orientation =  Rows | Columns
-                 deriving (Show, Eq)
+data Orientation =  Rows | Columns deriving (Show, Eq)
 
 data TemplateSettings = TemplateSettings { tsOrientation :: Orientation
                                          , tsRepeated    :: Int         -- ^ repeated row/column (depending on 'tsOrientation')
+                                                                        -- starting at 0.
                                          }
 
 
-data TemplateValue = TplText Text | TplDouble Double | TplLocalTime LocalTime
-                   deriving Show
+-- | data row as a map from template variable name to a 'CellValue'
+type TemplateDataRow = M.Map Text CellValue
 
--- | data row as a map from template variable name to a 'TemplateValue'
-type TemplateDataRow = M.Map Text TemplateValue
-
-data Converter = Match Text | PassThrough
-               deriving Show
-
-data TplCell = TplCell{ tplConverter :: Converter
-                      , tplSrc       :: Maybe CellData
-                      , tplX         :: Int
-                      }
-              deriving Show
-
-tpl2xlsx :: TemplateValue -> CellValue
-tpl2xlsx (TplText t) = CellText t
-tpl2xlsx (TplDouble d) = CellDouble d
-tpl2xlsx (TplLocalTime t) = CellLocalTime t
-
-replacePlaceholders :: [[Maybe CellData]] -> TemplateDataRow -> [[Maybe CellData]]
-replacePlaceholders d tdr = map (map $ fmap replace) d
+applyTemplateOnCell :: TemplateDataRow -> Cell -> Cell
+applyTemplateOnCell tdr cd@Cell{_cellValue=Just (CellText t)} =
+    either (const cd) (\ph -> cd{_cellValue=Just (phValue ph)}) (getVar t)
   where
-    replace :: CellData -> CellData
-    replace cd@CellData{cdValue=Just (CellText t)} =
-      either (const cd) (\ph -> cd{cdValue=Just (phValue ph)}) (getVar t)
-    replace cd = cd
-    phValue ph = maybe (CellText ph) tpl2xlsx (M.lookup ph tdr)
+    phValue ph = maybe (CellText ph) id (M.lookup ph tdr)
+applyTemplateOnCell _   cd = cd
 
 getVar :: Text -> Either ParseError Text
 getVar = parse varParser "unnecessary error"
   where
-    varParser = do
-      string "{{"
-      name <- many1 $ noneOf "}"
-      string "}}"
-      return $ pack name
-
-buildTemplate :: Int -> [Maybe CellData] -> [TplCell]
-buildTemplate x = map build
-  where
-    build cd = TplCell{ tplConverter = conv cd
-                      , tplSrc       = cd
-                      , tplX         = x}
-    conv (Just CellData{cdValue=Just (CellText t)}) = either (const PassThrough) Match (getVar t)
-    conv _ = PassThrough
-
-applyTemplate :: [TplCell] -> TemplateDataRow -> [Maybe CellData]
-applyTemplate t r = map transform t
-  where
-    transform tc = case tplConverter tc of
-      Match k     -> do
-        cd <- tplSrc tc
-        case M.lookup k r of
-          Just v  -> return cd{cdValue = Just (tpl2xlsx v)}
-          Nothing -> return cd
-
-      PassThrough -> tplSrc tc
+    varParser = string "{{" *> (pack <$> many1 (noneOf "}")) <* string "}}"
 
 fixColumns :: [ColumnsWidth] -> Int -> Int -> [ColumnsWidth]
 fixColumns cw c n = prolog ++ dataepilog
@@ -91,11 +49,16 @@ fixColumns cw c n = prolog ++ dataepilog
     (prolog, rest) = span ((<c) . cwMax) cw
     dataepilog = case rest of
       [] -> []
-      (dCW : rest') -> fixD dCW : fixEpilog rest'
-    fixD (ColumnsWidth dMin dMax width) = ColumnsWidth dMin (dMax + n - 1) width
-    fixEpilog = map (\(ColumnsWidth dMin dMax width) -> ColumnsWidth (dMin + n - 1) (dMax + n - 1) width)
+      (dCW : rest') -> fixD dCW : map fixEpilog rest'
+    fixD (ColumnsWidth dMin dMax width style) = ColumnsWidth dMin (dMax + n - 1) width style
+    fixEpilog (ColumnsWidth dMin dMax width style) = ColumnsWidth (dMin + n - 1) (dMax + n - 1) width style
+{- ColumnsWidth is not using lenses :(
+    fixD = cwMax +~ (n - 1)
+    fixEpilog = cwMin +~ (n - 1)
+              . cwMax +~ (n - 1)
+-}
 
-fixRowHeights :: RowHeights -> Int -> Int -> RowHeights
+fixRowHeights :: M.Map Int RowProperties -> Int -> Int -> M.Map Int RowProperties
 fixRowHeights rh r n = insertCopies $ shift removeOriginal
   where
     original = M.lookup r rh
@@ -105,30 +68,35 @@ fixRowHeights rh r n = insertCopies $ shift removeOriginal
       Just h -> foldr (\x m' -> M.insert x h m') m [r..(r + n -1)]
       Nothing -> m
 
-
-runSheet :: Xlsx -> Int -> (TemplateDataRow, TemplateSettings, [TemplateDataRow]) -> IO Worksheet
-runSheet x n (cdr, ts, d) = do
-  ws <- sheet x n
-  let
-    templateRows = if tsOrientation ts == Columns then transpose $ toList ws else toList ws
-    repeatRow = tsRepeated ts
-    (prolog, templateRow : epilog) = splitAt repeatRow templateRows
-    tpl = buildTemplate repeatRow templateRow
-    prolog' = replacePlaceholders prolog cdr
+applyTemplateOnSheet :: (TemplateDataRow, TemplateSettings, [TemplateDataRow]) -> Worksheet -> Worksheet
+applyTemplateOnSheet (cdr, ts, d) ws =
+    ws & wsColumns           .~ cw
+       & wsRowPropertiesMap  .~ rh
+       & wsCells             %~ applyTemplateOnCellMap
+  where
+    mayTranspose =
+      case tsOrientation ts of
+        Columns -> each . _1 %~ (\(x,y) -> (y,x))
+        _       -> id
+    repeatRow = tsRepeated ts + 1
     n = length d
-    d' = map (applyTemplate tpl) d
-    epilog' = replacePlaceholders epilog cdr
-    output = concat [prolog', d', epilog']
-    result = if tsOrientation ts == Columns then transpose output else output
+    applyTemplateOnCellMap =
+      M.fromList . mayTranspose . concatMap applyTemplateOnCellPos . mayTranspose . M.toList
+    applyTemplateOnCellPos ((row, col), cell)
+      | row < repeatRow = [ ((row,     col), applyTemplateOnCell cdr cell) ]
+      | row > repeatRow = [ ((row + n, col), applyTemplateOnCell cdr cell) ]
+      | otherwise       = [ ((row + i, col), applyTemplateOnCell dc  cell)
+                          | (i, dc) <- zip [0 ..] d ]
     (cw, rh) = if tsOrientation ts == Columns
-                 then (fixColumns (wsColumns ws) (repeatRow + 1) n, wsRowHeights ws)
-                 else (wsColumns ws, fixRowHeights (wsRowHeights ws) (repeatRow + 1) n)
-    in
-   return $ fromList (wsName ws) cw rh result
+                 then (fixColumns (ws ^. wsColumns) repeatRow n, ws ^. wsRowPropertiesMap)
+                 else (ws ^. wsColumns, fixRowHeights (ws ^. wsRowPropertiesMap) repeatRow n)
+
+applyTemplateOnXlsx :: [(TemplateDataRow, TemplateSettings, [TemplateDataRow])] -> Xlsx -> Xlsx
+applyTemplateOnXlsx options x =
+  x & xlSheets .~ zipWith (\(nm,sh) opt -> (nm, applyTemplateOnSheet opt sh)) (x ^. xlSheets) options
 
 -- | template runner: reads template, constructs new xlsx file based on template data and template settings
 run :: FilePath -> FilePath -> [(TemplateDataRow, TemplateSettings, [TemplateDataRow])] -> IO ()
 run tp op options = do
-  x@Xlsx{xlStyles=Styles sbs} <- xlsx tp
-  out <- mapM (uncurry (runSheet x)) $ zip [0..] options
-  writeXlsxStyles op sbs out
+  ct <- getPOSIXTime
+  L.writeFile op . fromXlsx ct . applyTemplateOnXlsx options . toXlsx =<< L.readFile tp
